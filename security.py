@@ -1,8 +1,14 @@
 
-import zipfile
-import xmlsec
-from lxml import etree
+import re
+import os
+import copy
 import binascii
+from hashlib import sha1
+from tempfile import NamedTemporaryFile, mkdtemp
+from shutil import rmtree
+
+from lxml import etree
+import xmlsec
 
 consts = xmlsec.constants
 
@@ -79,273 +85,522 @@ TransformMethod = dict({
 	'enveloped': consts.TransformEnveloped
 }, **CanonicalizationMethod)
 
+
 class epubSecurityDevice:
 	NSMAP = {
 		None: 'urn:oasis:names:tc:opendocument:xmlns:container',
 		'xenc': 'http://www.w3.org/2001/04/xmlenc#',
 		'ds': 'http://www.w3.org/2000/09/xmldsig#'
 	}
-	def __init__(self, epub, key):
-		self.epub = epub
-		self.key = None
-		self.load_key(key)
 
-	def load_key(self, kio, pkcs8=False, format='PEM', cert=False):
-		if isinstance(kio, str):
-			kio = open(kio, 'rb')
+	@classmethod
+	def load_publickey(self, buff, format='PEM', from_cert=False):
 		constant = 'KeyDataFormat'
-		if cert:
+		if from_cert:
 			constant += 'Cert'
-		elif pkcs8:
-			constant += 'Pkcs8'
 		constant += format.capitalize()
-		self.key = xmlsec.Key.from_file(kio, 
+		publickey = xmlsec.Key.from_memory(buff, getattr(consts, constant, consts.KeyDataFormatUnknown))
+		return publickey
+
+	@classmethod
+	def load_privatekey(self, buff, format='PEM'):
+		constant = 'KeyDataFormat'
+		# if pkcs8:
+		# 	constant += 'Pkcs8'
+		constant += format.capitalize()
+		privatekey = xmlsec.Key.from_memory(buff, format=getattr(consts, constant, consts.KeyDataFormatUnknown))
+		return privatekey
+
+	@classmethod
+	def load_x509_cert(self, key, buff, format='PEM'):
+		constant = 'KeyDataFormatCert' + format.capitalize()
+		key.load_cert_from_memory(buff, 
 			getattr(consts, constant, consts.KeyDataFormatUnknown))
 
-	def load_cert(self, certio, format='PEM'):
-		if not self.key:
-			return
-		if isinstance(certio, str):
-			kio = open(certio, 'rb')
-		constant = 'KeyDataFormatCert' + format.capitalize()
-		self.key.load_cert_from_file(certio, 
-			getattr(consts, constant, consts.KeyDataFormatUnknown))
+	@classmethod
+	def load_symmkey(self, buff, method='aes256'):
+		assert method in EncryptionMethod
+		key_format, key_size = EncryptionKeyType[method]
+		buff = buff[:key_size]
+		if len(buff) * 8 < key_size:
+			n = key_size // 8 - len(buff)
+			buff += n.to_bytes(1, 'big') * n
+		key = xmlsec.Key.from_binary_data(key_format, buff)
+		return key
+
+	@classmethod
+	def read_publickey(self, path, format='PEM', from_cert=False):
+		fp = open(path, 'rb')
+		buff = fp.read()
+		fp.close()
+		return self.load_publickey(buff, format=format, from_cert=from_cert)
+
+	@classmethod
+	def read_privatekey(self, path, format='PEM'):
+		fp = open(path, 'rb')
+		buff = fp.read()
+		fp.close()
+		return self.load_privatekey(buff, format=format)
+
+	@classmethod
+	def read_x509_cert(self, key, path, format='PEM'):
+		fp = open(path, 'rb')
+		buff = fp.read()
+		fp.close()
+		return self.load_x509_cert(key, buff, format=format)
+
+	@classmethod
+	def idpf_obfuscation(self, data, uid):
+		key = sha1(re.sub(r'\s', '', uid).encode('utf-8')).digest()
+
+		chunk = data[:1040]
+		outer = 0
+		obfuscated = bytearray()
+		while outer < 52:
+			inner = 0
+			while inner < 20:
+				index = outer*20+inner
+				if index >= len(chunk): break
+				sourceByte = chunk[index]
+				keyByte = key[inner]
+				obfuscated.append(sourceByte ^ keyByte)
+				inner += 1
+			outer += 1
+		return obfuscated+data[1040:]
+
+	@classmethod
+	def adobe_obfuscation(self, data, uid):
+		key = re.sub(r'(?:urn:uuid:)?(.*)', r'\1', uid)
+		key = re.sub(r'[^0-9A-Fa-f]', '', key).encode('utf-8')
+		key = binascii.unhexlify((key + key)[:32])
+		chunk = data[:1024]
+		outer = 0
+		obfuscated = bytearray()
+		while outer < 32:
+			inner = 0
+			while inner < 32:
+				index = outer*32+inner
+				if index >= len(chunk): break
+				sourceByte = chunk[index]
+				keyByte = key[inner]
+				obfuscated.append(sourceByte ^ keyByte)
+				inner += 1
+			outer += 1
+		return obfuscated+data[1024:]
+
 
 class epubEncryptor(epubSecurityDevice):
-	def __init__(self, epub, key):
-		epubSecurityDevice.__init__(self, epub, key)
-		self.method = 'aes256'
-		self.key_method = 'rsa-oaep'
-		self.wrap_method = ''
+	def __init__(self):
 		self.root = etree.Element('{%s}encryption' % self.NSMAP[None], nsmap=self.NSMAP)
-		self.references = []
-
-	def build_encryption(self, enc_type=None):
-		enc_type = EncryptionType.get(enc_type)
-
-		'''
-		<EncryptedData Type="">
-			<EncryptionMethod Algorithm="" />
-			<CipherData><CipherValue/></CipherData>
-		</EncryptedData>
-		'''
-		assert self.method in EncryptionMethod
-		method = EncryptionMethod[self.method]
+		self.wrapped_keys = []
+		self.publickey = None
+		
+	def make_enc_data(self, method='aes256', mode='binary'):
+		enc_type = EncryptionType.get(mode)
+		assert method in EncryptionMethod
+		method = EncryptionMethod[method]
 		enc_data = xmlsec.template.encrypted_data_create(
 			self.root, type=enc_type, method=method
 		)
 		xmlsec.template.encrypted_data_ensure_cipher_value(enc_data)
+		return copy.copy(enc_data)
 
-		'''
-		<KeyInfo>
-			<EncryptedKey>
-				<EncryptionMethod Algorithm="" />
-				<CipherData><CipherValue/></CipherData>
-			</EncryptedKey>
-		</KeyInfo>
-		'''
-		keyinfo = xmlsec.template.encrypted_data_ensure_key_info(enc_data)
-		if self.wrap_method:
-			assert self.wrap_method in KeyWrapMethod
-			wrap_method = KeyWrapMethod[self.wrap_method]
-			enc_key = xmlsec.template.add_encrypted_key(keyinfo, wrap_method)
-			xmlsec.template.encrypted_data_ensure_cipher_value(enc_key)
-			keyinfo = xmlsec.template.encrypted_data_ensure_key_info(enc_key)
-
-		assert self.key_method in KeyTransportMethod
-		key_method = KeyTransportMethod[self.key_method]
-		enc_key = xmlsec.template.add_encrypted_key(keyinfo, key_method)
+	@classmethod
+	def make_keyinfo(self, node, method, name=''):
+		keyinfo = xmlsec.template.encrypted_data_ensure_key_info(node)
+		enc_key = xmlsec.template.add_encrypted_key(keyinfo, method)
+		if name:
+			xmlsec.template.add_key_name(keyinfo, name)
 		xmlsec.template.encrypted_data_ensure_cipher_value(enc_key)
+		return keyinfo
+
+	@classmethod
+	def make_symmkey(self, method, data=b''):
+		key_format, key_size = EncryptionKeyType[method]
+		if data:
+			key_bytes = key_size // 8
+			data = data[:key_bytes]
+			n = key_bytes - len(data)
+			data += n.to_bytes(1, 'big') * n
+			key = xmlsec.Key.from_binary_data(key_format, data)
+		else:
+			key = xmlsec.Key.generate(key_format, key_size, consts.KeyDataTypeSymmetric)
+		return key
+
+	def set_publickey(self, pubkey, method='rsa-oaep', 
+		format='PEM', from_cert=False, name=''):
+		assert method in KeyTransportMethod
+		if not isinstance(pubkey, xmlsec.Key):
+			pubkey = self.load_publickey(pubkey, format=format, from_cert=from_cert)
+		method = KeyTransportMethod[method]
+		self.publickey = (pubkey, method, name)
+
+	def wrap_key(self, wrap_method='aes256', key=None, name=''):
+		assert wrap_method in KeyWrapMethod
+		if not isinstance(key, xmlsec.Key):
+			key = self.make_symmkey(wrap_method, data=key)
+		method = KeyWrapMethod[wrap_method]
+		self.wrapped_keys.append((key, method, name))
+
+	def make_encryption(self, key=None, mode='binary', method='aes256'):
+		assert any([self.publickey, self.wrapped_keys, key])
+		enc_data = self.make_enc_data(method=method, mode=mode)
+		keys = self.wrapped_keys[:]
+
+		if self.publickey:
+			keys.append(self.publickey)
+
+		parent = enc_data
+		for _, key_method, key_name in keys:
+			keyinfo = self.make_keyinfo(parent, key_method, name=key_name)
+			parent = keyinfo.find('{%s}EncryptedKey' % self.NSMAP['xenc'])
+
+		manager = xmlsec.KeysManager()
+		for subkey, _, __ in keys[::-1]:
+			manager.add_key(subkey)
+
+		ctx = xmlsec.EncryptionContext(manager)
+		ekey = key
+		if not isinstance(ekey, xmlsec.Key):
+			ekey = self.make_symmkey(method, data=ekey)
+		ctx.key = ekey
+
+		return enc_data, ctx
+
+	def encrypt_file(self, path, key=None, method='aes256'):
+		enc_data, ctx = self.make_encryption(key=key, method=method)
+		enc_data = ctx.encrypt_uri(enc_data, path)
 		return enc_data
 
-	def make_context(self):
-		manager = xmlsec.KeysManager()
-		manager.add_key(self.key)
+	def encrypt_binary(self, data, key=None, method='aes256'):
+		enc_data, ctx = self.make_encryption(key=key, method=method)
+		enc_data = ctx.encrypt_binary(enc_data, data)
+		return enc_data
 
-		klass, size = EncryptionKeyType[self.method]
-		key = xmlsec.Key.generate(klass, size, consts.KeyDataTypeSymmetric)
-		ctx = xmlsec.EncryptionContext(manager)
-		if self.wrap_method:
-			assert self.wrap_method in KeyWrapMethod
-			klass, size = EncryptionKeyType[self.wrap_method]
-			_key = xmlsec.Key.generate(klass, size, consts.KeyDataTypeSymmetric)
-			manager.add_key(_key)
-		ctx.key = key
-		return ctx
-
-	def encrypt_xml(self, node, enc_type='element'):
-		enc_data = self.build_encryption(enc_type=enc_type)
-		ctx = self.make_context()
-		return ctx.encrypt_xml(enc_data, node)
-
-	def encrypt_binary(self, data):
-		enc_data = self.build_encryption()
-		ctx = self.make_context()
-		return ctx.encrypt_binary(enc_data, data)
-
-	def encrypt_epub(self, outpath):
-		output = zipfile.ZipFile(outpath, 'w')
-
-		encrypted = set()
-		for ref in self.references:
-			path, *anchor = ref.split('#')
-			if not path in self.epub.namelist():
+	def encrypt_xml(self, root, xpath, key=None, method='aes256', xmlns='ns'):
+		if not isinstance(key, xmlsec.Key):
+			key = self.make_symmkey(method, data=key)
+			
+		nsmap = root.nsmap.copy()
+		if None in nsmap:
+			nsmap[xmlns] = nsmap.pop(None)
+			
+		template, ctx = self.make_encryption(key=key, mode='element', method=method)
+		for node in root.xpath(xpath, namespaces=nsmap):
+			if node.getparent() is None:
 				continue
-			fp = self.epub.open(path)
-			enc_data = self.encrypt_binary(fp.read())
-			cipher_value = enc_data.find('xenc:CipherData/xenc:CipherValue', 
-				namespaces=self.NSMAP)
-			data = binascii.a2b_base64(cipher_value.text)
-			output.writestr(path, data, zipfile.ZIP_DEFLATED)
-			cipher_ref = etree.Element('{%s}CipherReference' % self.NSMAP['xenc'])
-			cipher_ref.attrib['URI'] = path
-			cipher_value.getparent().replace(cipher_value, cipher_ref)
-			self.root.append(enc_data)
-			encrypted.add(path)
+			_node = copy.copy(node)
+			enc_data = ctx.encrypt_xml(template, _node)
+			node.getparent().replace(node, enc_data)
+			ctx.reset()
+			ctx.key = key
+		return root
 
-		output.writestr('META-INF/encryption.xml', 
-			etree.tostring(self.root, encoding='utf-8', 
-				xml_declaration=True, pretty_print=True), 
-			zipfile.ZIP_DEFLATED)
+	def encrypt_html(self, root, selector, key=None, method='aes256'):
+		if not isinstance(key, xmlsec.Key):
+			key = self.make_symmkey(method, data=key)
 
-		for info in self.epub.infolist():
-			path = info.filename
-			if path in encrypted: continue
-			output.writestr(info, self.epub.read(path), zipfile.ZIP_DEFLATED)
+		template, ctx = self.make_encryption(key=key, mode='element', method=method)
+		for elem in root.cssselect(selector):
+			if elem.getparent() is None:
+				continue
+			_elem = copy.copy(elem)
+			enc_data = ctx.encrypt_xml(template, _elem)
+			elem.getparent().replace(elem, enc_data)
+			ctx.reset()
+			ctx.key = key
+		return root
 
-		output.close()
+	@classmethod
+	def detach(self, enc_data, path):
+		enc_data = copy.copy(enc_data)
+		value = enc_data.find('xenc:CipherData/xenc:CipherValue', 
+			namespaces={'xenc': self.NSMAP['xenc']})
+		if value is None: return
+		data = binascii.a2b_base64(value.text)
+		ref = etree.Element('{%s}CipherReference' % self.NSMAP['xenc'])
+		ref.set('URI', path)
+		value.getparent().replace(value, ref)
+		return enc_data, data
 
-class epubDecryptor(epubSecurityDevice):
-	rootpath = 'META-INF/encryption.xml'
-	def __init__(self, epub, key):
-		epubSecurityDevice.__init__(self, epub, key)
-		self.references = {}
-		self.load_references()
+	@classmethod
+	def unbind_key(self, enc_data, keyid):
+		_enc_key = xmlsec.tree.find_node(enc_data, consts.NodeEncryptedKey, consts.EncNs)
+		if _enc_key is None: return
+		enc_key = copy.copy(_enc_key)
+		enc_key.set('Id', keyid)
+		retrieval = enc_data.makeelement(
+			etree.QName(consts.DSigNs, 'RetrievalMethod'), {
+				'URI': '#'+keyid, 
+				'Type': 'http://www.w3.org/2001/04/xmlenc#EncryptedKey'
+			})
+		_enc_key.getparent().replace(_enc_key, retrieval)
+		return enc_data, enc_key
 
-	def load_references(self):
-		with self.epub.open(self.rootpath) as fp:
-			root = etree.parse(fp).getroot()
-		xmlsec.tree.add_ids(root, root.xpath('//*[@Id]/@Id'))
-		for enc_data in root.findall('{%s}EncryptedData' % self.NSMAP['xenc']):
-			ref = enc_data.find(
-				'xenc:CipherData/xenc:CipherReference', 
-				namespaces=self.NSMAP)
-			if ref is None: continue
-			self.references[ref.get('URI')] = enc_data
 
-	def decrypt(self, enc_data):
+class XMLDecryptor(epubSecurityDevice):
+	@classmethod
+	def get_encinfo(self, enc_data):
+		enc_type = ['xml', 'binary'][bool(enc_data.get('Type'))-1]
+		method = enc_data.xpath('xenc:EncryptionMethod/@Algorithm', 
+			namespaces={'xenc': self.NSMAP['xenc']})[0]
+		ref_node = enc_data.find('xenc:CipherData/xenc:CipherReference', 
+			namespaces={'xenc': self.NSMAP['xenc']})
+		ref = ''
+		if ref_node is not None:
+			ref = ref_node.get('URI')
+		return method, ref, enc_type
+		
+	@classmethod
+	def envelop(self, enc_data, data):
+		ref = enc_data.find('xenc:CipherData/xenc:CipherReference', 
+			namespaces={'xenc': self.NSMAP['xenc']})
+		if ref is None: return
+		value = etree.Element('{%s}CipherValue' % self.NSMAP['xenc'])
+		ref.getparent().replace(ref, value)
+		value.text = binascii.b2a_base64(data)
+
+	@classmethod
+	def decrypt_binary(self, enc_data, key):
 		manager = xmlsec.KeysManager()
-		manager.add_key(self.key)
+		manager.add_key(key)
 
 		ctx = xmlsec.EncryptionContext(manager)
 		return ctx.decrypt(enc_data)
 
-	def decrypt_data(self, path):
-		enc_data = self.references[path]
-		ref = enc_data.find(
-			'xenc:CipherData/xenc:CipherReference', 
-			namespaces=self.NSMAP)
-		buff = binascii.b2a_base64(self.epub.read(path))
-		cipher_value = etree.Element('{%s}CipherValue' % self.NSMAP['xenc'])
-		cipher_value.text = buff
-		ref.getparent().replace(ref, cipher_value)
-		return self.decrypt(enc_data)
+	@classmethod
+	def decrypt_xml(self, root, key):
+		manager = xmlsec.KeysManager()
+		manager.add_key(key)
 
-	def decrypt_epub(self, outpath):
-		output = zipfile.ZipFile(outpath, 'w')
-
-		decrypted = set()
-		for ref in self.references:
-			if not ref in self.epub.namelist():
-				continue
-			data = self.decrypt_data(ref)
-			output.writestr(ref, data, zipfile.ZIP_DEFLATED)
-			decrypted.add(ref)
-
-		for info in self.epub.infolist():
-			path = info.filename
-			if path == self.rootpath:
-				continue
-			if path in decrypted: continue
-			output.writestr(info, self.epub.read(path), zipfile.ZIP_DEFLATED)
-
-		output.close()
-
-class epubSigner(epubSecurityDevice):
-	NSMAP = {
-		None: 'urn:oasis:names:tc:opendocument:xmlns:container'
-	}
-	def __init__(self, epub=None):
-		self.method = 'rsa-sha1'
-		self.c14n_method = 'exc-c14n'
-		self.digest_method = 'sha1'
-		self.transforms = ['enveloped']
-
-	def build_signature(self, node, use_cert=False):
-		'''
-		<Signature>
-			<CanonicalizationMethod Algorithm=""/>
-			<SignatureMethod Algorithm=""/>
-			<Reference>
-				<DigestMethod Algorithm=""/><DigestValue/>
-			</Reference>
-		</Signature>
-		'''
-		assert self.method in SignatureMethod
-		method = SignatureMethod[self.method]
-		assert self.c14n_method in CanonicalizationMethod
-		c14n_method = CanonicalizationMethod[self.c14n_method]
-		sign = xmlsec.template.create(node, 
-			sign_method=method, c14n_method=c14n_method
-		)
-		assert self.digest_method in DigestMethod
-		digest_method = DigestMethod[self.digest_method]
-		ref = xmlsec.template.add_reference(sign, digest_method)
-		xmlsec.template.add_transform(ref, consts.TransformEnveloped)
-
-		'''
-		<KeyInfo>
-			<X509Data><X509Certificate/></X509Data>
-			<KeyValue/>
-		</KeyInfo>
-		'''
-		keyinfo = xmlsec.template.ensure_key_info(sign)
-		if use_cert:
-			x509 = xmlsec.template.add_x509_data(keyinfo)
-			xmlsec.template.x509_data_add_certificate(x509)
-		else:
-			xmlsec.template.add_key_value(keyinfo)
-		
-		return sign
-
-	def sign(self, root, use_cert=False):
-		sign_node = self.build_signature(root, use_cert=use_cert)
-		root.append(sign_node)
-		ctx = xmlsec.SignatureContext()
-		ctx.key = self.key
-		ctx.sign(sign_node)
+		ctx = xmlsec.EncryptionContext(manager)
+		for enc_data in root.xpath('//xenc:EncryptedData', 
+			namespaces={'xenc': self.NSMAP['xenc']}):
+			elem = ctx.decrypt(copy.copy(enc_data))
+			enc_data.getparent().replace(enc_data, elem)
 		return root
 
-	def sign_binary(self, data):
-		ctx = xmlsec.SignatureContext()
-		ctx.key = self.key
-		assert self.method in SignatureMethod
-		method = SignatureMethod[self.method]
-		sign_node = ctx.sign_binary(data, method)
-		return sign_node
 
-class epubVerifier(epubSecurityDevice):
-	def verify(self, node):
-		ctx = xmlsec.SignatureContext()
-		ctx.key = self.key
-		sign = xmlsec.tree.find_child(node, consts.NodeSignature)
-		ctx.verify(sign)
-		return True
+class epubDecryptor(XMLDecryptor):
+	rootfile = 'META-INF/encryption.xml'
+	def __init__(self, epub):
+		self.epub = epub
+		self.encryption = {}
+		self.key = None
 
-	def verify_binary(self, raw, method, sign):
+	def load_encryption(self, root=None):
+		if root is None:
+			root = etree.parse(self.epub.open(self.rootfile)).getroot()
+		ids = root.xpath('//*[@Id]/@Id')
+		xmlsec.tree.add_ids(root, ids)
+		for enc_data in root.findall('{%s}EncryptedData' % self.NSMAP['xenc']):
+			method, uri, enc_type = self.get_encinfo(enc_data)
+			self.encryption[uri] = (enc_data, enc_type)
+
+	def decrypt_epub(self, uri, key=None):
+		assert isinstance(self.key or key, xmlsec.Key)
+		if not uri in self.epub.namelist():
+			return
+		enc_data, enc_type = self.encryption[uri]
+		self.envelop(enc_data, self.epub.read(uri))
+		return getattr(self, 'decrypt_' + enc_type)(enc_data, key or self.key)
+
+
+class epubSigner(epubSecurityDevice):
+	def __init__(self):
+		self.manifest = []
+		self.privatekey = None
+		self.root = etree.Element('{%s}signatures' % self.NSMAP[None], 
+			nsmap={None: self.NSMAP[None]})
+
+	def set_privatekey(self, pvtkey, method='rsa-sha1', format='PEM', key_name='', reset=True):
+		assert method in SignatureMethod
+		if not isinstance(pvtkey, xmlsec.Key):
+			pvtkey = self.load_privatekey(pvtkey, format=format)
+		self.privatekey = (pvtkey, method, key_name)
+		if reset:
+			self.manifest = []
+
+	def make_signature(self, method='rsa-sha1', c14n_method='exc-c14n', key_name=''):
 		assert method in SignatureMethod
 		method = SignatureMethod[method]
+		assert c14n_method in CanonicalizationMethod
+		c14n_method = CanonicalizationMethod[c14n_method]
+		
+		sign = xmlsec.template.create(self.root, 
+			sign_method=method, c14n_method=c14n_method
+		)
+		keyinfo = xmlsec.template.ensure_key_info(sign)
+		xmlsec.template.add_key_value(keyinfo)
+		if key_name:
+			xmlsec.template.add_key_name(keyinfo, key_name)
+		return copy.copy(sign)
+
+	def add_reference(self, parent, uri, binary=False, digest_method='sha1', transforms=[]):
+		sign = self.make_signature()
+		assert digest_method in DigestMethod
+		digest_method = DigestMethod[digest_method]
+		ref = xmlsec.template.add_reference(sign, digest_method, 
+			uri=uri)
+		if not binary:
+			for transform in transforms:
+				assert transform in TransformMethod
+				xmlsec.template.add_transform(ref, TransformMethod[transform])
+		parent.append(copy.copy(ref))
+
+	def add_object(self, path, binary=True, 
+		digest_method='sha1', transforms=[]):
+		self.manifest.append((path, binary, digest_method, transforms))
+
+	def sign(self, sign_id, c14n_method='exc-c14n', digest_method='sha1', transforms=[]):
+		assert self.privatekey and self.manifest
+		pvtkey, method, key_name = self.privatekey
+		dsig = self.make_signature(method=method, c14n_method=c14n_method, 
+			key_name=key_name)
+
+		assert digest_method in DigestMethod
+		digest_method = DigestMethod[digest_method]
+		ref = xmlsec.template.add_reference(dsig, digest_method, uri='#'+sign_id)
+		for transform in transforms:
+			assert transform in TransformMethod
+			xmlsec.template.add_transform(ref, TransformMethod[transform])
+
+		object_node = dsig.makeelement(
+			etree.QName(consts.DSigNs, consts.NodeObject))
+		manifest_node = dsig.makeelement(
+			etree.QName(consts.DSigNs, consts.NodeManifest), {'Id': sign_id})
+		object_node.append(manifest_node)
+		dsig.append(object_node)
+
 		ctx = xmlsec.SignatureContext()
-		ctx.key = self.key
-		ctx.verify_binary(raw, method, sign)
+		ctx.key = pvtkey
+
+		temp_uris = {}
+		for uri, sign_binary, sign_digest, sign_transforms in self.manifest:
+			if not os.path.isfile(uri):
+				continue
+			self.add_reference(manifest_node, uri, binary=sign_binary, 
+				digest_method=sign_digest, transforms=sign_transforms)
+
+		if not manifest_node.getchildren():
+			return
+
+		ctx.sign(dsig)
+		return dsig
+
+	def sign_epub(self, epub, sign_id, c14n_method='exc-c14n', 
+		digest_method='sha1', transforms=[]):
+		assert self.privatekey and self.manifest
+		pvtkey, method, key_name = self.privatekey
+		dsig = self.make_signature(method=method, c14n_method=c14n_method, 
+			key_name=key_name)
+
+		assert digest_method in DigestMethod
+		digest_method = DigestMethod[digest_method]
+		ref = xmlsec.template.add_reference(dsig, digest_method, uri='#'+sign_id)
+		for transform in transforms:
+			assert transform in TransformMethod
+			xmlsec.template.add_transform(ref, TransformMethod[transform])
+
+		object_node = dsig.makeelement(
+			etree.QName(consts.DSigNs, consts.NodeObject))
+		manifest_node = dsig.makeelement(
+			etree.QName(consts.DSigNs, consts.NodeManifest), {'Id': sign_id})
+		object_node.append(manifest_node)
+		dsig.append(object_node)
+
+		ctx = xmlsec.SignatureContext()
+		ctx.key = pvtkey
+
+		dtemp = mkdtemp()
+		for uri, sign_binary, sign_digest, sign_transforms in self.manifest:
+			if not uri in epub.namelist(): continue
+			self.add_reference(manifest_node, uri, binary=sign_binary, 
+				digest_method=sign_digest, transforms=sign_transforms)
+			epub.extract(uri, path=dtemp)
+
+		if not manifest_node.getchildren():
+			return
+
+		retval = os.getcwd()
+		os.chdir(dtemp)
+		try:
+			ctx.sign(dsig)
+		finally:
+			os.chdir(retval)
+			rmtree(dtemp)
+
+		return dsig
+
+
+class XMLVerifier(epubSecurityDevice):
+	@classmethod
+	def get_references(self, sign):
+		result = set()
+		refs = sign.xpath('ds:SignedInfo/ds:Reference/@URI', 
+			namespaces={'ds': self.NSMAP['ds']})
+		for ref in refs:
+			if not ref: continue
+			if not ref.startswith('#'):
+				result.add(ref)
+				continue
+			rid = ref[1:]
+			target = sign.xpath('//*[@Id="%s"]' % rid)
+			if not target: continue
+			target = target[0]
+			if target.tag != etree.QName(consts.DSigNs, consts.NodeManifest):
+				continue
+			for uri in target.xpath('ds:Reference/@URI', namespaces={'ds': self.NSMAP['ds']}):
+				if not uri or uri.startswith('#'): continue
+				result.add(uri)
+		return result
+
+	@classmethod
+	def verify(self, sign, key):
+		ctx = xmlsec.SignatureContext()
+		ctx.key = key
+		try:
+			ctx.verify(sign)
+		except xmlsec.Error:
+			return False
+		return True
+		
+
+class epubVerifier(XMLVerifier):
+	rootfile = 'META-INF/signatures.xml'
+	def __init__(self, epub):
+		self.epub = epub
+		self.key = None
+
+	def verify_epub(self, *keys, root=None):
+		def verify_each(root, ctx):
+			for i, dsig in enumerate(root.findall('{%s}Signature' % self.NSMAP['ds'])):
+				for uri in self.get_references(dsig):
+					self.epub.extract(uri, path=dtemp)
+				ctx.key = self.key or keys[min(i, len(keys)-1)]
+				ctx.verify(dsig)
+			return True
+
+		assert self.key or keys
+		if self.key:
+			assert isinstance(self.key, xmlsec.Key)
+		elif keys:
+			assert all(isinstance(key, xmlsec.Key) for key in keys)
+
+		dtemp = mkdtemp()
+		retval = os.getcwd()
+		os.chdir(dtemp)
+
+		if root is None:
+			root = etree.parse(self.epub.open(self.rootfile)).getroot()
+
+		ctx = xmlsec.SignatureContext()
+
+		try:
+			return verify_each(root, ctx)
+		except xmlsec.Error:
+			return False
+		finally:
+			os.chdir(retval)
+			rmtree(dtemp)
 		return True
