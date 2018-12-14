@@ -92,7 +92,10 @@ class epubSecurityDevice:
 		'xenc': 'http://www.w3.org/2001/04/xmlenc#',
 		'ds': 'http://www.w3.org/2000/09/xmldsig#'
 	}
-
+	obfuscation_uris = {
+		'http://www.idpf.org/2008/embedding': 'idpf',
+		'http://ns.adobe.com/pdf/enc#RC': 'adobe'
+	}
 	@classmethod
 	def load_publickey(self, buff, format='PEM', from_cert=False):
 		constant = 'KeyDataFormat'
@@ -188,8 +191,17 @@ class epubSecurityDevice:
 			outer += 1
 		return obfuscated+data[1024:]
 
+	@classmethod
+	def obfuscate(self, data, uid, method='idpf'):
+		enc_method = getattr(self, method+'_obfuscation', None)
+		if not enc_method: return data
+		return enc_method(data, uid)
 
 class epubEncryptor(epubSecurityDevice):
+	obfuscation_methods = {
+		'idpf': 'http://www.idpf.org/2008/embedding',
+		'adobe': 'http://ns.adobe.com/pdf/enc#RC'
+	}
 	def __init__(self):
 		self.root = etree.Element('{%s}encryption' % self.NSMAP[None], nsmap=self.NSMAP)
 		self.wrapped_keys = []
@@ -204,6 +216,16 @@ class epubEncryptor(epubSecurityDevice):
 		)
 		xmlsec.template.encrypted_data_ensure_cipher_value(enc_data)
 		return copy.copy(enc_data)
+
+	def make_obfuscation_node(self, path, method='idpf'):
+		enc_data = self.make_enc_data()
+		enc_method = enc_data.find(etree.QName(consts.EncNs, 'EncryptionMethod'))
+		enc_method.set('Algorithm', self.obfuscation_methods[method])
+		enc_value = xmlsec.tree.find_node(enc_data, consts.NodeCipherValue, consts.EncNs)
+		enc_ref = etree.Element(etree.QName(consts.EncNs, 'CipherReference'))
+		enc_ref.set('URI', path)
+		cipher_value.getparent.replace(cipher_value, enc_ref)
+		return enc_data
 
 	@classmethod
 	def make_keyinfo(self, node, method, name=''):
@@ -341,7 +363,7 @@ class epubEncryptor(epubSecurityDevice):
 class XMLDecryptor(epubSecurityDevice):
 	@classmethod
 	def get_encinfo(self, enc_data):
-		enc_type = ['xml', 'binary'][bool(enc_data.get('Type'))-1]
+		binary = not bool(enc_data.get('Type'))
 		method = enc_data.xpath('xenc:EncryptionMethod/@Algorithm', 
 			namespaces={'xenc': self.NSMAP['xenc']})[0]
 		ref_node = enc_data.find('xenc:CipherData/xenc:CipherReference', 
@@ -349,7 +371,7 @@ class XMLDecryptor(epubSecurityDevice):
 		ref = ''
 		if ref_node is not None:
 			ref = ref_node.get('URI')
-		return method, ref, enc_type
+		return method, ref, binary
 		
 	@classmethod
 	def envelop(self, enc_data, data):
@@ -386,7 +408,9 @@ class epubDecryptor(XMLDecryptor):
 	def __init__(self, epub):
 		self.epub = epub
 		self.encryption = {}
+		self.obfuscation = {}
 		self.key = None
+		self.uid = ''
 
 	def load_encryption(self, root=None):
 		if root is None:
@@ -394,17 +418,28 @@ class epubDecryptor(XMLDecryptor):
 		ids = root.xpath('//*[@Id]/@Id')
 		xmlsec.tree.add_ids(root, ids)
 		for enc_data in root.findall('{%s}EncryptedData' % self.NSMAP['xenc']):
-			method, uri, enc_type = self.get_encinfo(enc_data)
-			self.encryption[uri] = (enc_data, enc_type)
+			method, uri, binary = self.get_encinfo(enc_data)
+			if method in self.obfuscation_uris:
+				self.obfuscation[uri] = self.obfuscation_uris[method]
+				continue
+			if not binary:
+				enc_data = etree.parse(self.epub.open(uri)).getroot()
+			self.encryption[uri] = (enc_data, binary)
 
 	def decrypt_epub(self, uri, key=None):
-		assert isinstance(self.key or key, xmlsec.Key)
 		if not uri in self.epub.namelist():
 			return
-		enc_data, enc_type = self.encryption[uri]
+		if uri in self.obfuscation:
+			mode = self.obfuscation[uri]
+			return self.obfuscate(self.epub.read(uri), self.uid, method=mode)
+		if not uri in self.encryption:
+			return self.epub.read(uri)
+		assert isinstance(self.key or key, xmlsec.Key)
+		enc_data, binary = self.encryption[uri]
 		self.envelop(enc_data, self.epub.read(uri))
-		return getattr(self, 'decrypt_' + enc_type)(enc_data, key or self.key)
-
+		mode = ['xml', 'binary'][int(binary)]
+		return getattr(self, 'decrypt_' + mode)(enc_data, key or self.key)
+		
 
 class epubSigner(epubSecurityDevice):
 	def __init__(self):
@@ -448,8 +483,7 @@ class epubSigner(epubSecurityDevice):
 				xmlsec.template.add_transform(ref, TransformMethod[transform])
 		parent.append(copy.copy(ref))
 
-	def add_object(self, path, binary=True, 
-		digest_method='sha1', transforms=[]):
+	def add_object(self, path, binary=True, digest_method='sha1', transforms=[]):
 		self.manifest.append((path, binary, digest_method, transforms))
 
 	def sign(self, sign_id, c14n_method='exc-c14n', digest_method='sha1', transforms=[]):
